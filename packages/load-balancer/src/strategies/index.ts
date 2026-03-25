@@ -12,6 +12,8 @@ import {
 } from "@better-ccflare/types";
 
 export class SessionStrategy implements LoadBalancingStrategy {
+	private static readonly ANTHROPIC_SESSION_BURST_REQUEST_LIMIT = 3;
+	private static readonly ANTHROPIC_SESSION_REMAINING_SWITCH_THRESHOLD = 2;
 	private sessionDurationMs: number;
 	private store: StrategyStore | null = null;
 	private log = new Logger("SessionStrategy");
@@ -40,12 +42,11 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		// Usage windows: Anthropic accounts with proactive rate limit headers (usage-based accounts)
 		// No usage windows: Other account types or Anthropic console keys without usage windows
 		const rateLimitWindowReset =
-			account.provider === PROVIDER_NAMES.ANTHROPIC && // Explicit provider check for Anthropic usage windows
+			account.provider === PROVIDER_NAMES.ANTHROPIC &&
 			account.rate_limit_reset &&
-			account.rate_limit_reset < now - 1000; // 1 second buffer for clock skew protection
+			account.rate_limit_reset < now - 1000;
 
 		if (fixedDurationExpired || rateLimitWindowReset) {
-			// Reset session
 			if (this.store) {
 				const wasExpired = account.session_start !== null;
 				const resetReason = rateLimitWindowReset
@@ -54,11 +55,10 @@ export class SessionStrategy implements LoadBalancingStrategy {
 				this.log.info(
 					wasExpired
 						? `Session expired for account ${account.name} due to ${resetReason}, starting new session`
-						: `Starting new session for account ${account.name}`,
+						: `Starting new session for account ${account.name}`
 				);
 				this.store.resetAccountSession(account.id, now);
 
-				// Update the account object to reflect changes
 				account.session_start = now;
 				account.session_request_count = 0;
 			}
@@ -74,23 +74,188 @@ export class SessionStrategy implements LoadBalancingStrategy {
 	 * @returns true if session is active (Anthropic only), false otherwise
 	 */
 	private hasActiveSession(account: Account, now: number): boolean {
-		// Non-Anthropic providers (API-key-based, etc.) should not have persistent sessions
-		// since they're pay-as-you-go and don't benefit from session stickiness
 		if (!requiresSessionDurationTracking(account.provider)) {
 			return false;
 		}
 
-		// For Anthropic providers: check if session is active (within duration window)
+		return !!account.session_start && now - account.session_start < this.sessionDurationMs;
+	}
+
+	private compareByPriority(a: Account, b: Account): number {
+		return a.priority - b.priority;
+	}
+
+	private isAnthropicAccount(account: Account): boolean {
+		return account.provider === PROVIDER_NAMES.ANTHROPIC;
+	}
+
+	private getKnownRemaining(account: Account): number | null {
+		return typeof account.rate_limit_remaining === "number"
+			? account.rate_limit_remaining
+			: null;
+	}
+
+	private getKnownReset(account: Account): number | null {
+		return typeof account.rate_limit_reset === "number"
+			? account.rate_limit_reset
+			: null;
+	}
+
+	private compareAnthropicAccounts(a: Account, b: Account): number {
+		const remainingA = this.getKnownRemaining(a);
+		const remainingB = this.getKnownRemaining(b);
+
+		if (remainingA !== null && remainingB !== null && remainingA !== remainingB) {
+			return remainingB - remainingA;
+		}
+
+		if (remainingA !== null && remainingB === null) {
+			return -1;
+		}
+
+		if (remainingA === null && remainingB !== null) {
+			return 1;
+		}
+
+		const resetA = this.getKnownReset(a);
+		const resetB = this.getKnownReset(b);
+
+		if (resetA !== null && resetB !== null && resetA !== resetB) {
+			return resetA - resetB;
+		}
+
+		if (resetA !== null && resetB === null) {
+			return -1;
+		}
+
+		if (resetA === null && resetB !== null) {
+			return 1;
+		}
+
+		const priorityComparison = this.compareByPriority(a, b);
+		if (priorityComparison !== 0) {
+			return priorityComparison;
+		}
+
+		return (a.last_used ?? 0) - (b.last_used ?? 0);
+	}
+
+	private shouldKeepAnthropicSession(
+		activeAccount: Account,
+		candidateAccount: Account,
+	): boolean {
+		if (activeAccount.id === candidateAccount.id) {
+			return true;
+		}
+
+		if (
+			activeAccount.session_request_count >=
+			SessionStrategy.ANTHROPIC_SESSION_BURST_REQUEST_LIMIT
+		) {
+			return false;
+		}
+
+		const activeRemaining = this.getKnownRemaining(activeAccount);
+		const candidateRemaining = this.getKnownRemaining(candidateAccount);
+
+		if (activeRemaining === null || candidateRemaining === null) {
+			return activeAccount.priority <= candidateAccount.priority;
+		}
+
 		return (
-			!!account.session_start &&
-			now - account.session_start < this.sessionDurationMs
+			candidateRemaining - activeRemaining <=
+			SessionStrategy.ANTHROPIC_SESSION_REMAINING_SWITCH_THRESHOLD
 		);
+	}
+
+	private rankAnthropicAccounts(
+		availableAccounts: Account[],
+		activeAccount: Account | null,
+	): Account[] {
+		const rankedAccounts = [...availableAccounts].sort((a, b) =>
+			this.compareAnthropicAccounts(a, b),
+		);
+
+		if (!activeAccount) {
+			return rankedAccounts;
+		}
+
+		const activeAvailableAccount = rankedAccounts.find(
+			(account) => account.id === activeAccount.id,
+		);
+
+		if (!activeAvailableAccount) {
+			return rankedAccounts;
+		}
+
+		const leadingAccount = rankedAccounts[0];
+		if (
+			!leadingAccount ||
+			!this.shouldKeepAnthropicSession(
+				activeAvailableAccount,
+				leadingAccount,
+			)
+		) {
+			return rankedAccounts;
+		}
+
+		return [
+			activeAvailableAccount,
+			...rankedAccounts.filter(
+				(account) => account.id !== activeAvailableAccount.id,
+			),
+		];
+	}
+
+	private rankAvailableAccounts(
+		availableAccounts: Account[],
+		activeAccount: Account | null,
+	): Account[] {
+		if (availableAccounts.length <= 1) {
+			return availableAccounts;
+		}
+
+		if (availableAccounts.every((account) => this.isAnthropicAccount(account))) {
+			return this.rankAnthropicAccounts(availableAccounts, activeAccount);
+		}
+
+		if (activeAccount) {
+			const activeAvailableAccount = availableAccounts.find(
+				(account) => account.id === activeAccount.id,
+			);
+
+			if (activeAvailableAccount) {
+				const higherPriorityAccount = availableAccounts
+					.filter(
+						(account) =>
+							account.id !== activeAvailableAccount.id &&
+							account.priority < activeAvailableAccount.priority,
+					)
+					.sort((a, b) => this.compareByPriority(a, b))[0];
+
+				if (!higherPriorityAccount) {
+					return [
+						activeAvailableAccount,
+						...availableAccounts
+							.filter(
+								(account) => account.id !== activeAvailableAccount.id,
+							)
+							.sort((a, b) => this.compareByPriority(a, b)),
+					];
+				}
+
+				this.log.info(
+					`Skipping session on account ${activeAvailableAccount.name} (priority: ${activeAvailableAccount.priority}) — higher-priority account ${higherPriorityAccount.name} (priority: ${higherPriorityAccount.priority}) is available`,
+				);
+			}
+		}
+
+		return [...availableAccounts].sort((a, b) => this.compareByPriority(a, b));
 	}
 
 	select(accounts: Account[], meta: RequestMeta): Account[] {
 		const now = Date.now();
 
-		// Check if session tracking should be bypassed (for auto-refresh messages)
 		const bypassHeader = meta.headers?.get("x-better-ccflare-bypass-session");
 		const bypassSession = bypassHeader === "true";
 
@@ -102,7 +267,6 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			this.log.info("Session tracking bypassed due to bypass header");
 		}
 
-		// Cache availability checks within this request lifecycle
 		const availabilityCache = new Map<string, boolean>();
 		const getCachedAvailability = (account: Account): boolean => {
 			if (!availabilityCache.has(account.id)) {
@@ -111,7 +275,6 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			return availabilityCache.get(account.id) || false;
 		};
 
-		// Check for higher priority accounts that have become available due to rate limit reset
 		const fallbackCandidates = this.checkForAutoFallbackAccounts(accounts, now);
 		if (fallbackCandidates.length > 0) {
 			const chosenFallback = fallbackCandidates[0];
@@ -122,7 +285,6 @@ export class SessionStrategy implements LoadBalancingStrategy {
 				`Auto-fallback triggered to account ${chosenFallback.name} (priority: ${chosenFallback.priority}, auto-fallback enabled)`,
 			);
 
-			// If the chosen fallback account was paused, unpause it since we're reactivating it
 			if (chosenFallback.paused && this.store?.resumeAccount) {
 				this.log.info(
 					`Unpausing account ${chosenFallback.name} due to auto-fallback reactivation`,
@@ -131,15 +293,15 @@ export class SessionStrategy implements LoadBalancingStrategy {
 				chosenFallback.paused = false;
 			}
 
-			// Return fallback account first, then others sorted by priority
 			const others = accounts
-				.filter((a) => a.id !== chosenFallback.id && getCachedAvailability(a))
-				.sort((a, b) => a.priority - b.priority);
+				.filter(
+					(account) =>
+						account.id !== chosenFallback.id && getCachedAvailability(account),
+				)
+				.sort((a, b) => this.compareByPriority(a, b));
 			return [chosenFallback, ...others];
 		}
 
-		// Find account with active session (most recent session_start within window)
-		// Only for providers that require session duration tracking
 		let activeAccount: Account | null = null;
 		let mostRecentSessionStart = 0;
 
@@ -154,68 +316,53 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			}
 		}
 
-		// Log session tracking decisions for debugging
 		if (activeAccount) {
 			this.log.debug(
 				`Active session found for account ${activeAccount.name} (provider: ${activeAccount.provider})`,
 			);
 		} else {
 			this.log.debug(
-				`No active sessions found, will select from available accounts`,
+				"No active sessions found, will select from available accounts",
 			);
 		}
 
-		// If we have an active account and it's available, use it — unless a higher-priority
-		// non-session account is available (priority is more important than stickiness).
-		if (activeAccount && getCachedAvailability(activeAccount)) {
-			// Check if any available account has strictly higher priority than the active session account
-			const higherPriorityAccount = accounts
-				.filter(
-					(a) =>
-						a.id !== activeAccount.id &&
-						getCachedAvailability(a) &&
-						a.priority < activeAccount.priority,
-				)
-				.sort((a, b) => a.priority - b.priority)[0];
+		const availableAccounts = accounts.filter((account) =>
+			getCachedAvailability(account),
+		);
 
-			if (higherPriorityAccount) {
-				this.log.info(
-					`Skipping session on account ${activeAccount.name} (priority: ${activeAccount.priority}) — higher-priority account ${higherPriorityAccount.name} (priority: ${higherPriorityAccount.priority}) is available`,
-				);
-				// Fall through to normal priority-based selection below by nulling activeAccount
-			} else {
-				// Reset session if expired (shouldn't happen but just in case)
-				if (!bypassSession) {
-					this.resetSessionIfExpired(activeAccount);
-				}
-				this.log.info(
-					`Continuing session for account ${activeAccount.name} (${activeAccount.session_request_count} requests in session)`,
-				);
-				// Return active account first, then others as fallback (sorted by priority)
-				const others = accounts
-					.filter((a) => a.id !== activeAccount.id && getCachedAvailability(a))
-					.sort((a, b) => a.priority - b.priority);
-				return [activeAccount, ...others];
-			}
+		if (availableAccounts.length === 0) {
+			return [];
 		}
 
-		// No active session or active account is rate limited
-		// Filter available accounts and sort by priority (lower number = higher priority)
-		const available = accounts
-			.filter((a) => getCachedAvailability(a))
-			.sort((a, b) => a.priority - b.priority);
+		const rankedAccounts = this.rankAvailableAccounts(
+			availableAccounts,
+			bypassSession ? null : activeAccount,
+		);
+		const chosenAccount = rankedAccounts[0];
 
-		if (available.length === 0) return [];
+		if (!chosenAccount) {
+			return [];
+		}
 
-		// Pick the highest priority account (first in sorted list) and start a new session with it
-		const chosenAccount = available[0];
 		if (!bypassSession) {
 			this.resetSessionIfExpired(chosenAccount);
 		}
 
-		// Return chosen account first, then others as fallback (already sorted by priority)
-		const others = available.filter((a) => a.id !== chosenAccount.id);
-		return [chosenAccount, ...others];
+		if (activeAccount && chosenAccount.id === activeAccount.id) {
+			this.log.info(
+				`Continuing session for account ${activeAccount.name} (${activeAccount.session_request_count} requests in session)`,
+			);
+		} else if (
+			activeAccount &&
+			this.isAnthropicAccount(activeAccount) &&
+			this.isAnthropicAccount(chosenAccount)
+		) {
+			this.log.info(
+				`Switching Anthropic traffic from ${activeAccount.name} to ${chosenAccount.name} based on observed headroom (remaining: ${activeAccount.rate_limit_remaining ?? "unknown"} -> ${chosenAccount.rate_limit_remaining ?? "unknown"})`,
+			);
+		}
+
+		return [chosenAccount, ...rankedAccounts.filter((account) => account.id !== chosenAccount.id)];
 	}
 
 	/**
@@ -226,24 +373,14 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		accounts: Account[],
 		now: number,
 	): Account[] {
-		// Find accounts with auto-fallback enabled that:
-		// 1. Have an API reset time that has passed (usage window has reset)
-		// 2. Are not currently paused
-		// 3. Are not currently in a rate limited state (rate_limited_until is in the past or null)
 		const resetAccounts = accounts.filter((account) => {
 			if (!account.auto_fallback_enabled) return false;
-			// Note: We check paused status AFTER filtering for auto-fallback enabled accounts
-			// This allows paused accounts with auto-fallback to be considered for reactivation
 
-			// Check if the API usage window has reset for auto-fallback
-			// Usage windows: Anthropic accounts with proactive rate limit headers (usage-based accounts)
-			// No usage windows: Other account types or Anthropic console keys without usage windows
 			const anthropicWindowReset =
-				account.provider === PROVIDER_NAMES.ANTHROPIC && // Only for Anthropic accounts with usage windows
+				account.provider === PROVIDER_NAMES.ANTHROPIC &&
 				account.rate_limit_reset &&
-				account.rate_limit_reset < now - 1000; // 1 second buffer for clock skew protection
+				account.rate_limit_reset < now - 1000;
 
-			// Check if the account is not currently rate limited by our system
 			const notRateLimited =
 				!account.rate_limited_until || account.rate_limited_until <= now;
 
@@ -252,7 +389,6 @@ export class SessionStrategy implements LoadBalancingStrategy {
 
 		if (resetAccounts.length === 0) return [];
 
-		// Sort by priority (lower number = higher priority)
-		return resetAccounts.sort((a, b) => a.priority - b.priority);
+		return resetAccounts.sort((a, b) => this.compareByPriority(a, b));
 	}
 }
