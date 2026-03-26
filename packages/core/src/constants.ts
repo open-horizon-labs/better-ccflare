@@ -14,6 +14,9 @@ export const TIME_CONSTANTS = {
 	// Session durations - specifically for Anthropic usage windows
 	ANTHROPIC_SESSION_DURATION_DEFAULT: 5 * 60 * 60 * 1000, // 5 hours - default for Anthropic provider session tracking
 	ANTHROPIC_SESSION_DURATION_FALLBACK: 1 * 60 * 60 * 1000, // 1 hour - fallback for Anthropic provider
+
+	// Anthropic prompt cache TTL - cache is per-API-key and expires after ~5 min inactivity
+	ANTHROPIC_CACHE_TTL: 5 * 60 * 1000, // 5 minutes - after this idle gap, switching accounts is free
 	/**
 	 * @deprecated Use ANTHROPIC_SESSION_DURATION_DEFAULT instead.
 	 * This constant is kept for backward compatibility only and should not be used in new code.

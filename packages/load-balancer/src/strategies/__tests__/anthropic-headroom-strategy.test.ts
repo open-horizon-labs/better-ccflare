@@ -82,12 +82,13 @@ describe("SessionStrategy Anthropic headroom routing", () => {
 		]);
 	});
 
-	it("keeps the active Anthropic session when headroom is still close and burst budget remains", () => {
+	it("keeps the active Anthropic session when cache is warm, headroom is close, and burst budget remains", () => {
 		const activeAccount = createAccount({
 			id: "anthropic-active",
 			name: "anthropic-active",
 			session_start: Date.now() - 60_000,
 			session_request_count: 2,
+			last_used: Date.now() - 60_000, // cache is warm (< 5 min)
 			priority: 1,
 			rate_limit_remaining: 9,
 			rate_limit_reset: Date.now() + 30_000,
@@ -105,12 +106,62 @@ describe("SessionStrategy Anthropic headroom routing", () => {
 		expect(result[0]?.id).toBe("anthropic-active");
 	});
 
+	it("rebalances to highest-headroom account when cache is cold (idle > 5 min)", () => {
+		const activeAccount = createAccount({
+			id: "anthropic-active",
+			name: "anthropic-active",
+			session_start: Date.now() - 60_000,
+			session_request_count: 1,
+			last_used: Date.now() - 6 * 60 * 1000, // cache is cold (> 5 min)
+			priority: 0,
+			rate_limit_remaining: 9,
+			rate_limit_reset: Date.now() + 30_000,
+		});
+		const healthierAccount = createAccount({
+			id: "anthropic-healthier",
+			name: "anthropic-healthier",
+			priority: 1,
+			rate_limit_remaining: 15,
+			rate_limit_reset: Date.now() + 60_000,
+		});
+
+		const result = strategy.select([activeAccount, healthierAccount], meta);
+
+		// Cache is cold, so switching is free — pick by headroom
+		expect(result[0]?.id).toBe("anthropic-healthier");
+	});
+
+	it("rebalances when account has never been used (last_used is null)", () => {
+		const activeAccount = createAccount({
+			id: "anthropic-active",
+			name: "anthropic-active",
+			session_start: Date.now() - 60_000,
+			session_request_count: 1,
+			last_used: null, // never used — cache cannot be warm
+			priority: 0,
+			rate_limit_remaining: 9,
+			rate_limit_reset: Date.now() + 30_000,
+		});
+		const healthierAccount = createAccount({
+			id: "anthropic-healthier",
+			name: "anthropic-healthier",
+			priority: 1,
+			rate_limit_remaining: 15,
+			rate_limit_reset: Date.now() + 60_000,
+		});
+
+		const result = strategy.select([activeAccount, healthierAccount], meta);
+
+		expect(result[0]?.id).toBe("anthropic-healthier");
+	});
+
 	it("switches away from the active Anthropic session once the burst budget is exhausted", () => {
 		const exhaustedBurstAccount = createAccount({
 			id: "anthropic-active",
 			name: "anthropic-active",
 			session_start: Date.now() - 60_000,
 			session_request_count: 3,
+			last_used: Date.now() - 60_000, // cache is warm — but burst limit hit
 			priority: 0,
 			rate_limit_remaining: 9,
 			rate_limit_reset: Date.now() + 30_000,

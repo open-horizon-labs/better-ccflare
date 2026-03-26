@@ -140,12 +140,26 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		return (a.last_used ?? 0) - (b.last_used ?? 0);
 	}
 
+	private isCacheWarm(account: Account, now: number): boolean {
+		return (
+			account.last_used !== null &&
+			now - account.last_used < TIME_CONSTANTS.ANTHROPIC_CACHE_TTL
+		);
+	}
+
 	private shouldKeepAnthropicSession(
 		activeAccount: Account,
 		candidateAccount: Account,
+		now: number,
 	): boolean {
 		if (activeAccount.id === candidateAccount.id) {
 			return true;
+		}
+
+		// If the prompt cache is cold, switching accounts is free —
+		// no locality benefit to preserve, so pick by headroom alone.
+		if (!this.isCacheWarm(activeAccount, now)) {
+			return false;
 		}
 
 		if (
@@ -171,6 +185,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 	private rankAnthropicAccounts(
 		availableAccounts: Account[],
 		activeAccount: Account | null,
+		now: number,
 	): Account[] {
 		const rankedAccounts = [...availableAccounts].sort((a, b) =>
 			this.compareAnthropicAccounts(a, b),
@@ -194,6 +209,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			!this.shouldKeepAnthropicSession(
 				activeAvailableAccount,
 				leadingAccount,
+				now,
 			)
 		) {
 			return rankedAccounts;
@@ -210,13 +226,14 @@ export class SessionStrategy implements LoadBalancingStrategy {
 	private rankAvailableAccounts(
 		availableAccounts: Account[],
 		activeAccount: Account | null,
+		now: number,
 	): Account[] {
 		if (availableAccounts.length <= 1) {
 			return availableAccounts;
 		}
 
 		if (availableAccounts.every((account) => this.isAnthropicAccount(account))) {
-			return this.rankAnthropicAccounts(availableAccounts, activeAccount);
+			return this.rankAnthropicAccounts(availableAccounts, activeAccount, now);
 		}
 
 		if (activeAccount) {
@@ -337,6 +354,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		const rankedAccounts = this.rankAvailableAccounts(
 			availableAccounts,
 			bypassSession ? null : activeAccount,
+			now,
 		);
 		const chosenAccount = rankedAccounts[0];
 
@@ -357,8 +375,9 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			this.isAnthropicAccount(activeAccount) &&
 			this.isAnthropicAccount(chosenAccount)
 		) {
+			const cacheStatus = this.isCacheWarm(activeAccount, now) ? "cache-warm" : "cache-cold";
 			this.log.info(
-				`Switching Anthropic traffic from ${activeAccount.name} to ${chosenAccount.name} based on observed headroom (remaining: ${activeAccount.rate_limit_remaining ?? "unknown"} -> ${chosenAccount.rate_limit_remaining ?? "unknown"})`,
+				`Switching Anthropic traffic from ${activeAccount.name} to ${chosenAccount.name} (${cacheStatus}, remaining: ${activeAccount.rate_limit_remaining ?? "unknown"} -> ${chosenAccount.rate_limit_remaining ?? "unknown"})`,
 			);
 		}
 
