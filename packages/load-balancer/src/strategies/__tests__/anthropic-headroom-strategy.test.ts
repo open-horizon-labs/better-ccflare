@@ -160,7 +160,7 @@ describe("SessionStrategy Anthropic headroom routing", () => {
 			id: "anthropic-active",
 			name: "anthropic-active",
 			session_start: Date.now() - 60_000,
-			session_request_count: 3,
+			session_request_count: 50,
 			last_used: Date.now() - 60_000, // cache is warm — but burst limit hit
 			priority: 0,
 			rate_limit_remaining: 9,

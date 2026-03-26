@@ -12,7 +12,7 @@ import {
 } from "@better-ccflare/types";
 
 export class SessionStrategy implements LoadBalancingStrategy {
-	private static readonly ANTHROPIC_SESSION_BURST_REQUEST_LIMIT = 3;
+	private static readonly ANTHROPIC_SESSION_BURST_REQUEST_LIMIT = 50;
 	private static readonly ANTHROPIC_SESSION_REMAINING_SWITCH_THRESHOLD = 2;
 	private sessionDurationMs: number;
 	private store: StrategyStore | null = null;
