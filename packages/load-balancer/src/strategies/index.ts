@@ -109,12 +109,14 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			return remainingB - remainingA;
 		}
 
+		// An account with no rate-limit data has never been used (or headers are stale),
+		// meaning it likely has full capacity. Prefer it over one we know has been consumed.
 		if (remainingA !== null && remainingB === null) {
-			return -1;
+			return 1;
 		}
 
 		if (remainingA === null && remainingB !== null) {
-			return 1;
+			return -1;
 		}
 
 		const resetA = this.getKnownReset(a);
@@ -124,12 +126,14 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			return resetA - resetB;
 		}
 
+		// Same logic: no reset data means the account hasn't hit any limits.
+		// Prefer the fresh/unknown account over one with a known reset window.
 		if (resetA !== null && resetB === null) {
-			return -1;
+			return 1;
 		}
 
 		if (resetA === null && resetB !== null) {
-			return 1;
+			return -1;
 		}
 
 		const priorityComparison = this.compareByPriority(a, b);
