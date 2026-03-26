@@ -1,18 +1,18 @@
 {
-	"name": "better-ccflare",
-	"version": "3.3.12",
+	"name": "@oh-labs/oh-better-ccflare",
+	"version": "0.1.0",
 	"description": "Load balancer proxy for Claude API with intelligent distribution across multiple OAuth accounts to avoid rate limiting",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/tombii/better-ccflare.git"
+		"url": "git+https://github.com/open-horizon-labs/better-ccflare.git"
 	},
-	"homepage": "https://github.com/tombii/better-ccflare#readme",
+	"homepage": "https://github.com/open-horizon-labs/better-ccflare#readme",
 	"bugs": {
-		"url": "https://github.com/tombii/better-ccflare/issues"
+		"url": "https://github.com/open-horizon-labs/better-ccflare/issues"
 	},
 	"bin": {
-		"better-ccflare": "dist/better-ccflare"
+		"oh-better-ccflare": "dist/better-ccflare"
 	},
 	"type": "module",
 	"scripts": {
@@ -53,6 +53,7 @@
 		"monitoring"
 	],
 	"publishConfig": {
-		"access": "public"
+		"access": "public",
+		"registry": "https://registry.npmjs.org"
 	}
 }
